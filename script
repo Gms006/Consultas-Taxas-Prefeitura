@@ -1,0 +1,633 @@
+import asyncio
+import base64
+import json
+import os
+import time
+import re
+import logging
+import traceback
+from datetime import datetime
+from pathlib import Path
+from dotenv import load_dotenv
+from playwright.async_api import async_playwright, expect
+import requests
+import openpyxl
+from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+import sys
+import colorama
+from colorama import Fore, Back, Style
+
+# Inicializar colorama para funcionar em qualquer plataforma
+colorama.init()
+
+# Carregar variáveis de ambiente
+load_dotenv()
+
+# Configurações globais
+MODO_TESTE = False # Modo teste-> true= captcha manual, false= automático
+MODO_HEADLESS = True # Modo headless-> true= segundo plano, false= visível
+EXECUTABLE_PATH = "C:/Program Files/Google/Chrome/Application/chrome.exe"
+PLANILHA_PATH = "G:/PMA/LISTA EMPRESAS - NETO CONTABILIDADE 2025.xlsm"
+ISENCOES_PATH = "G:/PMA/SCRIPTS/Taxas/isenções.json"
+LOG_PATH = "G:/PMA/SCRIPTS/taxas/logs/consulta_taxas_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+ERROR_LOG_PATH = "G:/PMA/SCRIPTS/taxas/logs/erros_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+# Configuração de logging personalizada
+os.makedirs("logs", exist_ok=True)
+
+# Filtro personalizado para mensagens de terminal
+class TerminalLogFilter(logging.Filter):
+    def filter(self, record):
+        # Permitir mensagens de nível INFO ou maior para terminal
+        # Filtrar mensagens DEBUG muito detalhadas do terminal
+        if record.levelno >= logging.INFO:
+            return True
+        return False
+
+# Formatador de logs para arquivo (detalhado)
+file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+# Formatador para terminal (mais conciso e colorido)
+class ColoredFormatter(logging.Formatter):
+    def format(self, record):
+        # Formato base sem timestamp para o terminal
+        self._style._fmt = '%(message)s'
+        
+        # Adicionar cores baseadas no nível de log
+        if record.levelno >= logging.ERROR:
+            prefix = f"{Fore.RED}[✘] ERRO: "
+            suffix = Style.RESET_ALL
+        elif record.levelno >= logging.WARNING:
+            prefix = f"{Fore.YELLOW}[⚠] AVISO: "
+            suffix = Style.RESET_ALL
+        elif record.levelno >= logging.INFO:
+            # Adicionar formatação específica baseada em marcadores no log
+            if "[PROGRESSO]" in record.msg:
+                prefix = f"{Fore.CYAN}"
+                suffix = Style.RESET_ALL
+                record.msg = record.msg.replace("[PROGRESSO]", "")
+            elif "[SUCESSO]" in record.msg:
+                prefix = f"{Fore.GREEN}[✓] "
+                suffix = Style.RESET_ALL
+                record.msg = record.msg.replace("[SUCESSO]", "")
+            elif "[LOGIN]" in record.msg:
+                prefix = f"{Fore.MAGENTA}[🔑] "
+                suffix = Style.RESET_ALL
+                record.msg = record.msg.replace("[LOGIN]", "")
+            elif "[CONFIG]" in record.msg:
+                prefix = f"{Fore.BLUE}[⚙] "
+                suffix = Style.RESET_ALL
+                record.msg = record.msg.replace("[CONFIG]", "")
+            elif "[INICIO]" in record.msg or "[FIM]" in record.msg:
+                prefix = f"{Fore.CYAN}{'=' * 50}\n"
+                suffix = f"\n{'=' * 50}{Style.RESET_ALL}"
+                record.msg = record.msg.replace("[INICIO]", "").replace("[FIM]", "")
+            else:
+                prefix = ""
+                suffix = Style.RESET_ALL
+        else:
+            prefix = ""
+            suffix = ""
+        
+        # Formatar com prefixo e sufixo coloridos
+        formatted_message = super().format(record)
+        return f"{prefix}{formatted_message}{suffix}"
+
+# Configurar handlers
+# 1. Handler para arquivo de log principal
+file_handler = logging.FileHandler(LOG_PATH, encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(file_formatter)
+
+# 2. Handler para arquivo de erros
+error_handler = logging.FileHandler(ERROR_LOG_PATH, encoding='utf-8')
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(file_formatter)
+
+# 3. Handler para console com formatação colorida
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(ColoredFormatter())
+console_handler.addFilter(TerminalLogFilter())
+
+# Configurar o logger principal
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+logger.addHandler(file_handler)
+logger.addHandler(error_handler)
+logger.addHandler(console_handler)
+
+# Mapeamento de nomes de taxas para colunas da planilha
+MAPEAMENTO_TAXAS = {
+    "Taxa de Fiscalização de Funcionamento": "TAXA FUNCIONAMENTO",
+    "Taxa de Fiscalização de Anúncios": "TAXA PUBLICIDADE",
+    "ISS": "ISS",
+    "Taxa de Vigilância Sanitária": "TAXA VIG SANITÁRIA",
+    "Taxa de Localização e Instalação": "TAXA LOCALIZ INSTALAÇÃO",
+    "Preço Público Pela Ocupação e Uso de Área Pública": "TAXA OCUP ÁREA PÚBLICA"
+}
+
+# Índices das colunas na planilha (base 0)
+INDICES_COLUNAS = {
+    "EMPRESA": 0,  # Coluna A
+    "CNPJ": 1,     # Coluna B
+    "TAXA FUNCIONAMENTO": 2,  # Coluna C
+    "TAXA PUBLICIDADE": 3,    # Coluna D
+    "ISS": 4,                # Coluna E
+    "TAXA VIG SANITÁRIA": 5,  # Coluna F
+    "TAXA LOCALIZ INSTALAÇÃO": 6,  # Coluna G
+    "TAXA OCUP ÁREA PÚBLICA": 7    # Coluna H
+}
+
+def carregar_variaveis_ambiente():
+    """Carrega variáveis de ambiente do arquivo .env"""
+    usuario = os.getenv("USUARIO")
+    senha = os.getenv("SENHA")
+    api_key = os.getenv("API_KEY_2CAPTCHA")
+    if not usuario or not senha or not api_key:
+        logger.error("Verifique se USUARIO, SENHA e API_KEY_2CAPTCHA estão corretamente definidos no .env")
+        raise ValueError("ERRO: Verifique se USUARIO, SENHA e API_KEY_2CAPTCHA estão corretamente definidos no .env")
+    return usuario, senha, api_key
+
+def carregar_isencoes():
+    """Carrega o arquivo JSON de isenções de taxas"""
+    try:
+        with open(ISENCOES_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logger.warning(f"Erro ao carregar arquivo de isenções: {e}")
+        return {}
+
+def carregar_cnpjs_da_planilha():
+    """Carrega lista de CNPJs da aba 'CNPJs' da planilha"""
+    try:
+        logger.info("[CONFIG] Carregando CNPJs da planilha...")
+        wb = openpyxl.load_workbook(PLANILHA_PATH, read_only=True, data_only=True)
+        sheet = wb["CNPJs"]
+        cnpjs = []
+        for row in sheet.iter_rows(min_row=2, min_col=2, max_col=2):  # Coluna B
+            if row[0].value:
+                cnpj = str(row[0].value).strip()
+                # Normalizar CNPJ se necessário
+                if not re.match(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', cnpj):
+                    # Tenta formatar CNPJ numérico para o formato XX.XXX.XXX/XXXX-XX
+                    cnpj = re.sub(r'[^\d]', '', cnpj)
+                    if len(cnpj) == 14:
+                        cnpj = f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+                cnpjs.append(cnpj)
+        wb.close()
+        logger.info(f"[SUCESSO] {len(cnpjs)} CNPJs carregados da planilha")
+        return cnpjs
+    except Exception as e:
+        logger.error(f"Erro ao carregar CNPJs da planilha: {e}")
+        with open(ERROR_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(f"\n\nErro ao carregar CNPJs da planilha:\n{traceback.format_exc()}")
+        raise
+
+def resolver_captcha_2captcha(image_base64, api_key):
+    """Resolve captcha usando o serviço 2CAPTCHA"""
+    logger.info("[LOGIN] Enviando captcha para resolução com 2CAPTCHA")
+    url = "http://2captcha.com/in.php"
+    data = {'method': 'base64', 'key': api_key, 'body': image_base64, 'json': 1}
+    response = requests.post(url, data=data).json()
+    if response.get("status") != 1:
+        logger.error(f"Erro ao enviar captcha: {response}")
+        raise Exception("Erro ao enviar captcha")
+    
+    captcha_id = response["request"]
+    logger.info(f"[LOGIN] Captcha enviado com ID: {captcha_id}. Aguardando resolução...")
+    
+    for attempt in range(1, 21):
+        time.sleep(5)
+        res = requests.get(f"http://2captcha.com/res.php?key={api_key}&action=get&id={captcha_id}&json=1").json()
+        if res.get("status") == 1:
+            logger.info(f"[SUCESSO] Captcha resolvido")
+            return res["request"]
+        # Log detalhado apenas para arquivo, não para terminal
+        logging.getLogger().debug(f"Tentativa {attempt}/20: {res}")
+    
+    logger.error("Timeout na resolução do captcha")
+    raise Exception("Timeout na resolução do captcha")
+
+def interpretar_parcelas(texto):
+    """Interpreta o formato de parcelas e retorna o status conforme padrão"""
+    texto = texto.strip().lower()
+    if texto in ("única", "0", "0,1"):
+        return "Em Aberto"
+    if "a" in texto:
+        partes = texto.split("a", 1)
+        if len(partes) < 2 or not partes[0].isdigit() or not partes[1].isdigit():
+            return "Em Aberto"
+        ini, fim = map(int, partes)
+        abertas = fim - ini + 1
+        total = fim
+    elif "," in texto:
+        parcelas = [int(p.strip()) for p in texto.split(",") if p.strip().isdigit()]
+        if not parcelas:
+            return "Em Aberto"
+        abertas = len(parcelas)
+        total = max(parcelas)
+    elif texto.isdigit():
+        abertas = 1
+        total = int(texto)
+    else:
+        return "Em Aberto"
+    pagas = total - abertas
+    return f"{pagas}/{total}"
+
+def formatar_status_para_planilha(taxas):
+    """Formata o status das taxas de acordo com o padrão da planilha"""
+    # Agrupar taxas por tipo
+    taxas_por_tipo = {}
+    for taxa in taxas:
+        nome_taxa = taxa["nome"]
+        resultado = taxa["resultado"]
+        exercicio = taxa["exercicio"]
+        
+        # Buscar o tipo correto da taxa baseado no nome
+        tipo_taxa = None
+        for key, value in MAPEAMENTO_TAXAS.items():
+            if key in nome_taxa:
+                tipo_taxa = value
+                break
+        
+        if not tipo_taxa:
+            logging.getLogger().debug(f"Taxa não mapeada: {nome_taxa}")
+            continue
+        
+        if tipo_taxa not in taxas_por_tipo:
+            taxas_por_tipo[tipo_taxa] = []
+        
+        taxas_por_tipo[tipo_taxa].append({
+            "exercicio": exercicio,
+            "resultado": resultado
+        })
+    
+    # Formatar o status final para cada tipo de taxa
+    resultado_final = {}
+    for tipo_taxa, detalhes in taxas_por_tipo.items():
+        if len(detalhes) == 1:
+            # Caso único: usar diretamente o resultado
+            resultado_final[tipo_taxa] = detalhes[0]["resultado"]
+        else:
+            # Múltiplos exercícios: verificar se são consecutivos
+            exercicios = [int(d["exercicio"]) for d in detalhes if d["exercicio"] and d["exercicio"].isdigit()]
+            if not exercicios:
+                resultado_final[tipo_taxa] = "Em Aberto"
+                continue
+                
+            exercicios.sort()
+            if len(exercicios) > 1 and all(exercicios[i] + 1 == exercicios[i+1] for i in range(len(exercicios)-1)):
+                # Exercícios consecutivos
+                resultado_final[tipo_taxa] = f"{exercicios[0]} até {exercicios[-1]} em aberto"
+            else:
+                # Exercícios não consecutivos
+                resultado_final[tipo_taxa] = "Vários exerc. em aberto"
+    
+    # CORREÇÃO: Adicionar "Pago" para os tipos de taxa não encontrados
+    # Isso garante que taxas sem débitos sejam marcadas como pagas
+    for tipo_taxa in MAPEAMENTO_TAXAS.values():
+        if tipo_taxa not in resultado_final:
+            resultado_final[tipo_taxa] = "Pago"
+    
+    return resultado_final
+
+async def realizar_login(page, usuario, senha, api_key):
+    """Realiza login no portal do cidadão"""
+    logger.info("[LOGIN] Acessando portal do cidadão...")
+    await page.goto("https://portaldocidadao.anapolis.go.gov.br/")
+    await page.fill('input[id="101817"]', usuario)
+    await page.fill('input[id="101818"]', senha)
+    
+    if MODO_TESTE:
+        logger.info(f"{Fore.YELLOW}[LOGIN] MODO TESTE ATIVADO: Resolva o CAPTCHA manualmente no navegador.{Style.RESET_ALL}")
+        input(f"{Fore.YELLOW}✅ Quando terminar, clique em 'Acessar' no site e depois aperte ENTER aqui para continuar...{Style.RESET_ALL}")
+    else:
+        captcha_bytes = await page.locator("img.step-img").screenshot()
+        captcha_img = base64.b64encode(captcha_bytes).decode("utf-8")
+        logging.getLogger().debug(f"Captcha Image Base64: {captcha_img[:30]}...")
+        resposta = resolver_captcha_2captcha(captcha_img, api_key)
+        logger.info(f"[LOGIN] Preenchendo captcha com resposta: {resposta}")
+        await page.fill('input[id="101819"]', resposta)
+        await page.click('input[id="101822"]')
+    
+    logger.info("[SUCESSO] Login realizado com sucesso")
+
+async def consultar_cnpj(page, cnpj, idx, total):
+    """Consulta um CNPJ específico e extrai seus débitos"""
+    try:
+        # Barra de progresso
+        porcentagem = (idx / total) * 100
+        barra = f"[{Fore.GREEN}{'█' * int(porcentagem/5)}{Fore.WHITE}{'░' * (20 - int(porcentagem/5))}{Style.RESET_ALL}] {porcentagem:.1f}% ({idx}/{total})"
+        logger.info(f"[PROGRESSO] {barra}")
+        logger.info(f"Consultando CNPJ {cnpj}")
+        
+        # Navegar para consulta
+        await page.hover("a.pure-menu-link:text('Consultar')")
+        await page.click("a[data-navigation='20206']")
+        
+        # Buscar CNPJ
+        await page.wait_for_selector("input.tablesorter-filter[data-column='4']", timeout=10000)
+        await page.fill("input.tablesorter-filter[data-column='4']", cnpj)
+        await page.keyboard.press("Enter")
+        
+        await page.wait_for_selector("#grid67248")
+        xpath = f"(//tr[td//div[contains(text(), '{cnpj}')]]//input[@type='radio'])[1]"
+        checkbox = page.locator(xpath)
+        
+        try:
+            await expect(checkbox).to_be_visible(timeout=10000)
+        except Exception:
+            logger.warning(f"Cliente não encontrado para o CNPJ {cnpj}")
+            return []
+            
+        await checkbox.check()
+        
+        await page.wait_for_selector('input[id="67252"]', timeout=10000)
+        await page.click('input[id="67252"]')
+        await page.wait_for_timeout(3000)
+        
+        if await page.locator("text=A inscrição informada não possui nenhum débito no momento").is_visible():
+            logger.info(f"[SUCESSO] Cliente {cnpj} está regular - sem débitos")
+            return []
+            
+        return await extrair_taxas_detalhadas(page, cnpj)
+    except Exception as e:
+        logger.error(f"Erro ao consultar CNPJ {cnpj}: {e}")
+        with open(ERROR_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(f"\n\nErro ao consultar CNPJ {cnpj}:\n{traceback.format_exc()}")
+        raise
+
+async def extrair_taxas_detalhadas(page, cnpj):
+    """Extrai detalhes das taxas clicando nas engrenagens"""
+    taxas_total = []
+    try:
+        engrenagens = await page.locator("button.nfe-action").all()
+        
+        if engrenagens:
+            logger.info(f"Processando {len(engrenagens)} débitos encontrados")
+        
+        for idx, engrenagem in enumerate(engrenagens):
+            # Log mais compacto para o terminal
+            logger.debug(f"Clicando em 'Detalhar' ({idx + 1}/{len(engrenagens)})...")
+            
+            # Clicar na engrenagem e aguardar o menu aparecer
+            await engrenagem.click()
+            await page.wait_for_timeout(1000)  # Aguarda 1 segundo para o menu aparecer
+            
+            try:
+                # Primeiro tenta pelo seletor específico
+                detalhar = page.locator(f".fg-menu-container a[data-op='DETALHA_DIVIDA'][data-key='{idx + 1}']")
+                if await detalhar.count() > 0:
+                    await detalhar.first.click()
+                else:
+                    # Se não encontrar, tenta um seletor mais genérico
+                    detalhar_alt = page.locator(".fg-menu-container a[data-op='DETALHA_DIVIDA']")
+                    if await detalhar_alt.count() > 0:
+                        await detalhar_alt.first.click()
+                    else:
+                        # Última alternativa - busca por texto
+                        detalhar_texto = page.locator(".fg-menu-container a:has-text('Detalhar')")
+                        await detalhar_texto.first.click()
+                
+                # Espera base para carregamento
+                await page.wait_for_timeout(1500)
+                
+                # Espera pela tabela ser carregada
+                await page.wait_for_selector("table.jqgrid tbody tr.jqgrow", state="visible", timeout=20000)
+                
+                # Extrai as taxas
+                taxas = await extrair_taxas(page)
+                taxas_total.extend(taxas)
+                
+            except Exception as e:
+                logger.error(f"Erro ao processar engrenagem {idx + 1}: {e}")
+                continue
+                
+    except Exception as e:
+        logger.error(f"Erro ao extrair taxas detalhadas para {cnpj}: {e}")
+        with open(ERROR_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(f"\n\nErro ao extrair taxas detalhadas para {cnpj}:\n{traceback.format_exc()}")
+    
+    return taxas_total
+
+async def extrair_taxas(page):
+    """Extrai informações das taxas da tabela exibida"""
+    await page.wait_for_selector("table.jqgrid tbody tr.jqgrow", timeout=10000)
+    linhas = await page.locator("table.jqgrid tbody tr").all()
+    exercicio_atual = None
+    taxas_resultado = []
+    
+    for linha in linhas:
+        classes = await linha.get_attribute("class") or ""
+        if "jqgroup" in classes:
+            texto = await linha.inner_text()
+            if "Exercício:" in texto:
+                exercicio_atual = texto.split("Exercício:")[-1].strip()
+            continue
+        
+        if "jqgrow" not in classes:
+            continue
+            
+        colunas = await linha.locator("td").all_text_contents()
+        if len(colunas) < 6:
+            continue
+            
+        nome_taxa = colunas[3].strip()
+        parcelas = colunas[5].strip()
+        
+        # Ignora linhas com valores monetários ou sem nome de taxa ou sem parcelas
+        if not nome_taxa or nome_taxa.startswith("R$") or not parcelas:
+            continue
+            
+        status = interpretar_parcelas(parcelas)
+        resultado = status if status != "Em Aberto" else f"{exercicio_atual} em aberto" if exercicio_atual != "2025" else "Em Aberto"
+        
+        taxas_resultado.append({
+            "exercicio": exercicio_atual,
+            "nome": nome_taxa,
+            "parcelas": parcelas,
+            "resultado": resultado
+        })
+    
+    # Reduzir log para tornar a saída mais limpa
+    if taxas_resultado:
+        tipos_taxa = set(taxa["nome"] for taxa in taxas_resultado)
+        logger.info(f"Encontradas {len(taxas_resultado)} taxas de {len(tipos_taxa)} tipos diferentes")
+        # Usar DEBUG para não poluir o console, mas manter os detalhes no arquivo de log
+        for taxa in taxas_resultado:
+            logging.getLogger().debug(f" → [{taxa['exercicio']}] {taxa['nome']} – {taxa['resultado']}")
+    else:
+        logger.info("Nenhuma taxa encontrada na tabela")
+    
+    return taxas_resultado
+
+def atualizar_planilha(cnpj, taxas_formatadas, isencoes):
+    """Atualiza a planilha com os dados extraídos"""
+    try:
+        # Carregar planilha preservando macros
+        wb = openpyxl.load_workbook(PLANILHA_PATH, keep_vba=True)
+        sheet = wb["TAXAS"]
+        
+        # Procurar linha do CNPJ
+        linha_encontrada = None
+        for row_idx, row in enumerate(sheet.iter_rows(min_row=2, min_col=2, max_col=2), start=2):
+            cell_value = str(row[0].value or "").strip()
+            # Remover formatação para comparar apenas os dígitos
+            cell_digits = re.sub(r'[^\d]', '', cell_value)
+            cnpj_digits = re.sub(r'[^\d]', '', cnpj)
+            
+            if cell_digits == cnpj_digits:
+                linha_encontrada = row_idx
+                break
+        
+        if not linha_encontrada:
+            logger.warning(f"CNPJ {cnpj} não encontrado na aba TAXAS da planilha")
+            return False
+        
+        # Verificar isenções para este CNPJ
+        cnpj_sem_formatacao = re.sub(r'[^\d]', '', cnpj)
+        isencoes_cnpj = isencoes.get(cnpj_sem_formatacao, [])
+        
+        # Atualizar cada coluna de taxa
+        for tipo_taxa, status in taxas_formatadas.items():
+            if tipo_taxa not in INDICES_COLUNAS:
+                logging.getLogger().debug(f"Tipo de taxa não mapeado na planilha: {tipo_taxa}")
+                continue
+                
+            col_idx = INDICES_COLUNAS[tipo_taxa] + 1  # +1 porque openpyxl é base 1
+            cell = sheet.cell(row=linha_encontrada, column=col_idx)
+            
+            # Verificar se a célula tem um asterisco (empresa isenta)
+            if cell.value == "*" or any(taxa_map in isencoes_cnpj for taxa_map in [tipo_taxa]):
+                logging.getLogger().debug(f"Célula com '*' encontrada para {cnpj} na coluna {tipo_taxa}. Mantendo isenção.")
+                continue
+            
+            # Se houver status, atualizar a célula
+            cell.value = status
+        
+        # Salvar planilha preservando formatação e macros
+        wb.save(PLANILHA_PATH)
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao atualizar planilha para CNPJ {cnpj}: {e}")
+        with open(ERROR_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(f"\n\nErro ao atualizar planilha para CNPJ {cnpj}:\n{traceback.format_exc()}")
+        return False
+
+async def processar_cnpjs(page, cnpjs, isencoes):
+    """Processa a lista de CNPJs, realizando consultas e atualizando a planilha"""
+    total = len(cnpjs)
+    sucessos = 0
+    falhas = 0
+    relogins = 0
+    
+    logger.info(f"Iniciando processamento de {total} CNPJs")
+    
+    for idx, cnpj in enumerate(cnpjs, start=1):
+        try:
+            # Tentar processar o CNPJ atual
+            taxas = await consultar_cnpj(page, cnpj, idx, total)
+            status_formatados = formatar_status_para_planilha(taxas)
+            
+            # Atualizar a planilha com as informações obtidas
+            if atualizar_planilha(cnpj, status_formatados, isencoes):
+                logger.info(f"[SUCESSO] CNPJ {cnpj} processado e planilha atualizada")
+                sucessos += 1
+            else:
+                logger.warning(f"CNPJ {cnpj} – Falha ao atualizar planilha")
+                falhas += 1
+                
+        except Exception as e:
+            erro_msg = str(e).split('\n')[0]
+            logger.error(f"CNPJ {cnpj} – Falha: {erro_msg}")
+            falhas += 1
+            
+            # Verificar se é necessário fazer login novamente (após várias consultas)
+            if idx > 1 and (idx % 10 == 0 or "TimeoutError" in str(e)):
+                logger.warning(f"Possível timeout ou erro de sessão. Tentando relogin...")
+                try:
+                    # Voltar à página inicial
+                    await page.goto("https://portaldocidadao.anapolis.go.gov.br/")
+                    # Refazer login
+                    usuario, senha, api_key = carregar_variaveis_ambiente()
+                    await realizar_login(page, usuario, senha, api_key)
+                    relogins += 1
+                    logger.info(f"[SUCESSO] Relogin #{relogins} realizado com sucesso")
+                except Exception as login_err:
+                    erro_login = str(login_err).split('\n')[0]
+                    logger.error(f"Falha ao fazer relogin: {erro_login}")
+                    with open(ERROR_LOG_PATH, 'a', encoding='utf-8') as f:
+                        f.write(f"\n\nFalha ao fazer relogin:\n{traceback.format_exc()}")
+    
+    # Resumo final com estatísticas
+    taxa_sucesso = (sucessos / total) * 100 if total > 0 else 0
+    logger.info(f"""
+{Fore.CYAN}{'=' * 70}{Style.RESET_ALL}
+{Fore.GREEN}✅ PROCESSAMENTO FINALIZADO{Style.RESET_ALL}
+
+{Fore.CYAN}📊 RESUMO ESTATÍSTICO:{Style.RESET_ALL}
+  • Total de CNPJs processados: {total}
+  • Processados com sucesso: {sucessos} ({taxa_sucesso:.1f}%)
+  • Falhas: {falhas}
+  • Relogins necessários: {relogins}
+{Fore.CYAN}{'=' * 70}{Style.RESET_ALL}
+""")
+    
+    return sucessos, falhas, relogins
+
+async def main():
+    # Carregar variáveis e dados necessários
+    logger.info("[INICIO] CONSULTA DE TAXAS - NETO CONTABILIDADE")
+    
+    try:
+        USUARIO, SENHA, API_KEY = carregar_variaveis_ambiente()
+        cnpjs = carregar_cnpjs_da_planilha()
+        isencoes = carregar_isencoes()
+        
+        logger.info("[CONFIG] Configurações carregadas")
+        logger.debug(f"USUARIO: {USUARIO}")
+        logger.debug(f"SENHA: {'****' if SENHA else None}")
+        logger.debug(f"API_KEY: {API_KEY[:4] + '...' if API_KEY else None}")
+        logger.info(f"{Fore.CYAN}• CNPJs a consultar: {len(cnpjs)}{Style.RESET_ALL}")
+        logger.info(f"{Fore.CYAN}• Empresas com isenções: {len(isencoes)}{Style.RESET_ALL}")
+        logger.info(f"{Fore.BLUE}• Modo teste: {'ATIVADO' if MODO_TESTE else 'DESATIVADO'}{Style.RESET_ALL}")
+        
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=MODO_HEADLESS, executable_path=EXECUTABLE_PATH)
+            context = await browser.new_context(ignore_https_errors=True)
+            page = await context.new_page()
+            
+            logger.info("[LOGIN] Iniciando processo de autenticação...")
+            await realizar_login(page, USUARIO, SENHA, API_KEY)
+            
+            logger.info("[PROGRESSO] Iniciando consultas dos CNPJs")
+            await processar_cnpjs(page, cnpjs, isencoes)
+            
+            logger.info("Finalizando navegação...")
+            await context.close()
+            await browser.close()
+        
+        logger.info("[FIM] SCRIPT FINALIZADO COM SUCESSO")
+        
+    except Exception as e:
+        erro_msg = str(e).split('\n')[0]
+        logger.error(f"Erro crítico durante a execução: {erro_msg}")
+        with open(ERROR_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(f"\n\nErro crítico durante a execução:\n{traceback.format_exc()}")
+        logger.error("[FIM] SCRIPT FINALIZADO COM ERROS")
+
+if __name__ == "__main__":
+    try:
+        # Imprimir cabeçalho colorido
+        print(f"""
+{Fore.CYAN}{'=' * 70}
+{Fore.CYAN}█▀▀ █▀█ █▄░█ █▀ █░█ █░░ ▀█▀ █▀█   █▀▄ █▀▀   ▀█▀ █▀█ ▀▄▀ █▀█ █▀
+{Fore.CYAN}█▄▄ █▄█ █░▀█ ▄█ █▄█ █▄▄ ░█░ █▀█   █▄▀ ██▄   ░█░ █▀█ █░█ █▀█ ▄█
+{Fore.CYAN}{'=' * 70}{Style.RESET_ALL}
+""")
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.warning(f"{Fore.YELLOW}[!] Programa interrompido pelo usuário{Style.RESET_ALL}")
+        logger.info("[FIM] SCRIPT FINALIZADO MANUALMENTE")
