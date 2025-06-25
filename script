@@ -30,6 +30,7 @@ PLANILHA_PATH = "G:/PMA/LISTA EMPRESAS - NETO CONTABILIDADE 2025.xlsm"
 ISENCOES_PATH = "G:/PMA/SCRIPTS/Taxas/isenções.json"
 LOG_PATH = "G:/PMA/SCRIPTS/taxas/logs/consulta_taxas_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 ERROR_LOG_PATH = "G:/PMA/SCRIPTS/taxas/logs/erros_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+MAX_TENTATIVAS = 2  # Quantidade de vezes que um CNPJ pode ser reprocessado em caso de erro
 
 # Configuração de logging personalizada
 os.makedirs("logs", exist_ok=True)
@@ -531,40 +532,44 @@ async def processar_cnpjs(page, cnpjs, isencoes):
     logger.info(f"Iniciando processamento de {total} CNPJs")
     
     for idx, cnpj in enumerate(cnpjs, start=1):
-        try:
-            # Tentar processar o CNPJ atual
-            taxas = await consultar_cnpj(page, cnpj, idx, total)
-            status_formatados = formatar_status_para_planilha(taxas)
-            
-            # Atualizar a planilha com as informações obtidas
-            if atualizar_planilha(cnpj, status_formatados, isencoes):
-                logger.info(f"[SUCESSO] CNPJ {cnpj} processado e planilha atualizada")
-                sucessos += 1
-            else:
-                logger.warning(f"CNPJ {cnpj} – Falha ao atualizar planilha")
+        tentativa = 1
+        while tentativa <= MAX_TENTATIVAS:
+            try:
+                # Tentar processar o CNPJ atual
+                taxas = await consultar_cnpj(page, cnpj, idx, total)
+                status_formatados = formatar_status_para_planilha(taxas)
+
+                # Atualizar a planilha com as informações obtidas
+                if atualizar_planilha(cnpj, status_formatados, isencoes):
+                    logger.info(f"[SUCESSO] CNPJ {cnpj} processado e planilha atualizada")
+                    sucessos += 1
+                else:
+                    logger.warning(f"CNPJ {cnpj} – Falha ao atualizar planilha")
+                    falhas += 1
+                break
+
+            except Exception as e:
+                erro_msg = str(e).split('\n')[0]
+                logger.error(f"CNPJ {cnpj} – Falha: {erro_msg}")
                 falhas += 1
-                
-        except Exception as e:
-            erro_msg = str(e).split('\n')[0]
-            logger.error(f"CNPJ {cnpj} – Falha: {erro_msg}")
-            falhas += 1
-            
-            # Verificar se é necessário fazer login novamente (após várias consultas)
-            if idx > 1 and (idx % 10 == 0 or "TimeoutError" in str(e)):
-                logger.warning(f"Possível timeout ou erro de sessão. Tentando relogin...")
-                try:
-                    # Voltar à página inicial
-                    await page.goto("https://portaldocidadao.anapolis.go.gov.br/")
-                    # Refazer login
-                    usuario, senha, api_key = carregar_variaveis_ambiente()
-                    await realizar_login(page, usuario, senha, api_key)
-                    relogins += 1
-                    logger.info(f"[SUCESSO] Relogin #{relogins} realizado com sucesso")
-                except Exception as login_err:
-                    erro_login = str(login_err).split('\n')[0]
-                    logger.error(f"Falha ao fazer relogin: {erro_login}")
-                    with open(ERROR_LOG_PATH, 'a', encoding='utf-8') as f:
-                        f.write(f"\n\nFalha ao fazer relogin:\n{traceback.format_exc()}")
+
+                # Tentar relogin apenas uma vez em caso de timeout ou erro similar
+                if tentativa < MAX_TENTATIVAS and ("timeout" in erro_msg.lower() or "TimeoutError" in str(e)):
+                    logger.warning("Possível timeout ou erro de sessão. Tentando relogin e nova tentativa...")
+                    try:
+                        await page.goto("https://portaldocidadao.anapolis.go.gov.br/")
+                        usuario, senha, api_key = carregar_variaveis_ambiente()
+                        await realizar_login(page, usuario, senha, api_key)
+                        relogins += 1
+                        logger.info(f"[SUCESSO] Relogin #{relogins} realizado com sucesso")
+                        tentativa += 1
+                        continue
+                    except Exception as login_err:
+                        erro_login = str(login_err).split('\n')[0]
+                        logger.error(f"Falha ao fazer relogin: {erro_login}")
+                        with open(ERROR_LOG_PATH, 'a', encoding='utf-8') as f:
+                            f.write(f"\n\nFalha ao fazer relogin:\n{traceback.format_exc()}")
+                break
     
     # Resumo final com estatísticas
     taxa_sucesso = (sucessos / total) * 100 if total > 0 else 0
